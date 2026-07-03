@@ -1,4 +1,4 @@
-🌱 Overview
+### 🌱 Overview
 
 LP-YOLO is a lightweight object detection framework designed for maize ear endpoint localization in complex field environments.
 The model focuses on improving the representation of weak structural keypoints (ear tip and ear base) under challenges such as:
@@ -12,7 +12,9 @@ Complex background interference
 Small object sensitivity
 
 To achieve this, LP-YOLO introduces a Progressive Feature Refinement Bottleneck (PFRB) and integrates it into a YOLO-based backbone, replacing conventional convolutional bottlenecks to enhance feature discrimination while maintaining computational efficiency.
-⚙️ Environment Installation
+
+### ⚙️ EnvironmentInstallation
+
 1️⃣ Create environment
 ```
 conda create -n lp_yolo python=3.9 -y
@@ -40,7 +42,8 @@ datasets/maize/
 │   ├── val/
 │   └── test/
 ```
-🏋️ Training
+### 🏋️ Training
+
 Run training script
 ```
 python ultralytics/ear/train_ear.py
