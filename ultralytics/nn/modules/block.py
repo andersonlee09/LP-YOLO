@@ -49,6 +49,8 @@ __all__ = (
     "Attention",
     "PSA",
     "SCDown",
+    "C3k_DG",
+    "C3k2_DG",
 )
 
 
@@ -329,7 +331,184 @@ class GhostBottleneck(nn.Module):
         """Applies skip connection and concatenation to input tensor."""
         return self.conv(x) + self.shortcut(x)
 
+class LFEB(nn.Module):
+    """
+    Local Feature Enhancement Block
+    replaces dynamic kernel generation
+    """
 
+    def __init__(self, c):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(c, c, kernel_size=3, padding=1, groups=1, bias=False),
+            nn.BatchNorm2d(c),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(c, c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(c),
+        )
+
+    def forward(self, x):
+        return x + self.conv(x)
+
+class HFRU(nn.Module):
+    """
+    Hierarchical Feature Refinement Unit
+    replaces LESDB
+    """
+
+    def __init__(self, c, depth=3):
+        super().__init__()
+        self.blocks = nn.ModuleList([LFEB(c) for _ in range(depth)])
+
+    def forward(self, x):
+        feats = []
+
+        for blk in self.blocks:
+            x = blk(x)
+            feats.append(x)
+
+        # hierarchical aggregation (not concat-heavy)
+        out = sum(feats) / len(feats)
+        return out
+class PFRU(nn.Module):
+    """
+    Progressive Feature Refinement Unit
+    replaces DynamicConv
+    """
+
+    def __init__(self, c, depth=3, reduction=4):
+        super().__init__()
+
+        self.hfru = HFRU(c, depth)
+
+        # channel recalibration (instead of dynamic kernel generation)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        self.fc = nn.Sequential(
+            nn.Linear(c, c // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(c // reduction, c, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+
+        # 1. progressive refinement
+        x = self.hfru(x)
+
+        # 2. global channel modeling
+        context = self.pool(x).view(b, c)
+        weight = self.fc(context).view(b, c, 1, 1)
+
+        # 3. feature modulation (instead of dynamic convolution)
+        out = x * weight
+
+        return out
+
+class DynamicConv(nn.Module):
+    """
+    Simple dynamic convolution:
+    generate attention weights based on input feature
+    """
+
+    def __init__(self, c1, k=3, reduction=4):
+        super().__init__()
+        self.k = k
+        self.padding = k // 2
+
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+
+        self.fc = nn.Sequential(
+            nn.Linear(c1, c1 // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(c1 // reduction, k * k, bias=False)
+        )
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+
+        # 1. global context
+        context = self.avgpool(x).view(b, c)
+
+        # 2. generate dynamic kernel weights
+        weights = self.fc(context)
+        weights = weights.view(b, 1, self.k, self.k)
+        weights = torch.softmax(weights.view(b, -1), dim=1).view(b, 1, self.k, self.k)
+
+        # 3. unfold input
+        unfold = F.unfold(x, kernel_size=self.k, padding=self.padding)
+        unfold = unfold.view(b, c, self.k * self.k, h * w)
+
+        # 4. apply dynamic weights
+        out = (unfold * weights.view(b, 1, -1, 1)).sum(dim=2)
+
+        return out.view(b, c, h, w)
+class GSConvBlock(nn.Module):
+    """
+    simplified GSConv block
+    """
+
+    def __init__(self, c1, c2):
+        super().__init__()
+        c_ = c2 // 2
+
+        self.cv1 = nn.Conv2d(c1, c_, 1, 1, 0)
+        self.cv2 = nn.Conv2d(c_, c_, 3, 1, 1, groups=c_)
+
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        x1 = self.cv1(x)
+        x2 = self.cv2(x1)
+
+        y = torch.cat([x1, x2], dim=1)
+
+        # channel shuffle
+        b, c, h, w = y.shape
+        y = y.view(b, 2, c // 2, h, w)
+        y = y.permute(0, 2, 1, 3, 4).contiguous()
+        y = y.view(b, c, h, w)
+
+        return self.act(self.bn(y))
+
+class DynamicGSBottleneck(nn.Module):
+    """
+    Bottleneck replacement:
+    DynamicConv → GSConv fusion
+    """
+
+    def __init__(self, c1, c2, shortcut=True, k=3, e=0.5):
+        super().__init__()
+
+        c_ = int(c2 * e)
+
+        # 1. reduce channels
+        self.cv1 = nn.Conv2d(c1, c_, 1, 1, 0)
+
+        # 2. dynamic conv enhancement
+        # self.dynamic = DynamicConv(c_, k=k)
+        self.pfru = PFRU(c_)
+        # 3. GSConv feature fusion
+        self.gs = GSConvBlock(c_, c2)
+
+        self.shortcut = shortcut and c1 == c2
+
+        # optional projection for residual
+        self.res_conv = nn.Conv2d(c1, c2, 1, 1, 0) if c1 != c2 else nn.Identity()
+
+    def forward(self, x):
+        identity = self.res_conv(x)
+
+        x = self.cv1(x)
+        x = self.pfru(x)
+        x = self.gs(x)
+
+        if self.shortcut:
+            return x + identity
+        else:
+            return x
 class Bottleneck(nn.Module):
     """Standard bottleneck."""
 
@@ -345,6 +524,20 @@ class Bottleneck(nn.Module):
         """Applies the YOLO FPN to input data."""
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
+class DGSRConv(nn.Module):
+    """Standard bottleneck."""
+
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
+        """Initializes a standard bottleneck module with optional shortcut connection and configurable parameters."""
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, k[0], 1)
+        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        """Applies the YOLO FPN to input data."""
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 class BottleneckCSP(nn.Module):
     """CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks."""
@@ -432,7 +625,7 @@ class MaxSigmoidAttnBlock(nn.Module):
 
         aw = torch.einsum("bmchw,bnmc->bmhwn", embed, guide)
         aw = aw.max(dim=-1)[0]
-        aw = aw / (self.hc**0.5)
+        aw = aw / (self.hc ** 0.5)
         aw = aw + self.bias[None, :, None, None]
         aw = aw.sigmoid() * self.scale
 
@@ -494,7 +687,7 @@ class ImagePoolingAttn(nn.Module):
         """Executes attention mechanism on input tensor x and guide tensor."""
         bs = x[0].shape[0]
         assert len(x) == self.nf
-        num_patches = self.k**2
+        num_patches = self.k ** 2
         x = [pool(proj(x)).view(bs, -1, num_patches) for (x, proj, pool) in zip(x, self.projections, self.im_pools)]
         x = torch.cat(x, dim=-1).transpose(1, 2)
         q = self.query(text)
@@ -507,7 +700,7 @@ class ImagePoolingAttn(nn.Module):
         v = v.reshape(bs, -1, self.nh, self.hc)
 
         aw = torch.einsum("bnmc,bkmc->bmnk", q, k)
-        aw = aw / (self.hc**0.5)
+        aw = aw / (self.hc ** 0.5)
         aw = F.softmax(aw, dim=-1)
 
         x = torch.einsum("bmnk,bkmc->bnmc", aw, v)
@@ -720,6 +913,27 @@ class C3f(nn.Module):
         return self.cv3(torch.cat(y, 1))
 
 
+def make_divisible(x, divisor=8):
+    import math
+    return math.ceil(x / divisor) * divisor
+
+
+# --- 2. StarNet 核心模块 (CVPR 2024) ---
+class StarBlock(nn.Module):
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(c_, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        # Star Operation: 元素级乘法实现高维特征映射
+        return x + self.cv3(self.cv1(x) * self.cv2(x)) if self.add else self.cv3(self.cv1(x) * self.cv2(x))
+
+
+
 class C3k2(C2f):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
@@ -732,6 +946,27 @@ class C3k2(C2f):
 
 
 class C3k(C3):
+    """C3k is a CSP bottleneck module with customizable kernel sizes for feature extraction in neural networks."""
+
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, k=3):
+        """Initializes the C3k module with specified channels, number of layers, and configurations."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        # self.m = nn.Sequential(*(RepBottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
+
+class C3k2_DG(C2f):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+        """Initializes the C3k2 module, a faster CSP Bottleneck with 2 convolutions and optional C3k blocks."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            C3k_DG(self.c, self.c, 2, shortcut, g) if c3k else DynamicGSBottleneck(self.c, self.c, shortcut, g) for _ in range(n)
+        )
+
+
+class C3k_DG(C3):
     """C3k is a CSP bottleneck module with customizable kernel sizes for feature extraction in neural networks."""
 
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, k=3):
@@ -888,7 +1123,7 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.key_dim = int(self.head_dim * attn_ratio)
-        self.scale = self.key_dim**-0.5
+        self.scale = self.key_dim ** -0.5
         nh_kd = self.key_dim * num_heads
         h = dim + nh_kd * 2
         self.qkv = Conv(dim, h, 1, act=False)

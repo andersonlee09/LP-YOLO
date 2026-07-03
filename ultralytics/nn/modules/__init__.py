@@ -56,6 +56,8 @@ from .block import (
     RepVGGDW,
     ResNetLayer,
     SCDown,
+    C3k_DG,
+    C3k2_DG
 )
 from .conv import (
     CBAM,
@@ -71,6 +73,7 @@ from .conv import (
     LightConv,
     RepConv,
     SpatialAttention,
+    MyCBAM,
 )
 from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect
 from .transformer import (
@@ -85,6 +88,8 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
+
+from .wavelet_modules import WTConv2d
 
 __all__ = (
     "Conv",
@@ -156,4 +161,7 @@ __all__ = (
     "C2fCIB",
     "Attention",
     "PSA",
+    "MyCBAM",
+    "WTConv2d",
+    "C3k2_DG",
 )

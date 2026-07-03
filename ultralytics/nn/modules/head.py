@@ -107,7 +107,7 @@ class Detect(nn.Module):
 
         if self.export and self.format in {"saved_model", "pb", "tflite", "edgetpu", "tfjs"}:  # avoid TF FlexSplitV ops
             box = x_cat[:, : self.reg_max * 4]
-            cls = x_cat[:, self.reg_max * 4 :]
+            cls = x_cat[:, self.reg_max * 4:]
         else:
             box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
 
@@ -220,6 +220,155 @@ class OBB(Detect):
         """Decode rotated bounding boxes."""
         return dist2rbox(bboxes, self.angle, anchors, dim=1)
 
+import torch.nn.functional as F
+
+
+class LWModule(nn.Module):
+    def __init__(self, num_kpt, reduction=2):
+        super().__init__()
+
+        self.K = num_kpt
+        self.r = reduction  # spatial downsample ratio
+
+        dim_xy = 2 * num_kpt
+        dim_c = num_kpt
+
+        # -----------------------------
+        # projections
+        # -----------------------------
+        self.q_xy = nn.Conv2d(dim_xy, dim_xy, 1)
+        self.k_xy = nn.Conv2d(dim_xy, dim_xy, 1)
+        self.v_xy = nn.Conv2d(dim_xy, dim_xy, 1)
+
+        self.q_c = nn.Conv2d(dim_c, dim_xy, 1)
+        self.k_c = nn.Conv2d(dim_c, dim_xy, 1)
+        self.v_c = nn.Conv2d(dim_c, dim_xy, 1)
+
+        # output projection
+        self.proj_xy = nn.Conv2d(dim_xy, dim_xy, 1)
+        self.proj_c = nn.Conv2d(dim_xy, dim_c, 1)
+
+        # gates
+        self.alpha = nn.Parameter(torch.tensor(-2.1972))
+        self.beta = nn.Parameter(torch.tensor(-2.1972))
+
+        self.softmax = nn.Softmax(dim=-1)
+
+    # -----------------------------
+    # flatten
+    # -----------------------------
+    def _flat(self, x):
+        B, C, H, W = x.shape
+        return x.view(B, C, H * W), H, W
+
+    def _unflat(self, x, H, W):
+        B, C, _ = x.shape
+        return x.view(B, C, H, W)
+
+    # -----------------------------
+    # forward
+    # -----------------------------
+    def forward(self, x):
+        """
+        x: (B, 3K, H, W)
+        """
+
+        B, _, H, W = x.shape
+
+        xy, c = torch.split(x, [2 * self.K, self.K], dim=1)
+
+        # =========================
+        # QKV
+        # =========================
+        Qxy, Kxy, Vxy = self.q_xy(xy), self.k_xy(xy), self.v_xy(xy)
+        Qc, Kc, Vc = self.q_c(c), self.k_c(c), self.v_c(c)
+
+        # =========================
+        # spatial downsample (KEY FIX)
+        # =========================
+        if self.r > 1:
+            Qxy_s = F.avg_pool2d(Qxy, self.r)
+            Kxy_s = F.avg_pool2d(Kxy, self.r)
+            Vxy_s = F.avg_pool2d(Vxy, self.r)
+
+            Qc_s = F.avg_pool2d(Qc, self.r)
+            Kc_s = F.avg_pool2d(Kc, self.r)
+            Vc_s = F.avg_pool2d(Vc, self.r)
+        else:
+            Qxy_s, Kxy_s, Vxy_s = Qxy, Kxy, Vxy
+            Qc_s, Kc_s, Vc_s = Qc, Kc, Vc
+
+        # =========================
+        # flatten to tokens
+        # =========================
+        Qxy_s, _, _ = self._flat(Qxy_s)
+        Kxy_s, _, _ = self._flat(Kxy_s)
+        Vxy_s, _, _ = self._flat(Vxy_s)
+
+        Qc_s, _, _ = self._flat(Qc_s)
+        Kc_s, _, _ = self._flat(Kc_s)
+        Vc_s, _, _ = self._flat(Vc_s)
+
+        Qxy_s = Qxy_s.transpose(1, 2)
+        Kxy_s = Kxy_s.transpose(1, 2)
+        Vxy_s = Vxy_s.transpose(1, 2)
+
+        Qc_s = Qc_s.transpose(1, 2)
+        Kc_s = Kc_s.transpose(1, 2)
+        Vc_s = Vc_s.transpose(1, 2)
+
+        # =========================
+        # XY attends to CONF
+        # =========================
+        attn_xy = self.softmax(
+            torch.bmm(Qxy_s, Kc_s.transpose(1, 2)) / (self.K ** 0.5)
+        )
+        dxy = torch.bmm(attn_xy, Vc_s)
+
+        # =========================
+        # CONF attends to XY
+        # =========================
+        attn_c = self.softmax(
+            torch.bmm(Qc_s, Kxy_s.transpose(1, 2)) / (self.K ** 0.5)
+        )
+        dc = torch.bmm(attn_c, Vxy_s)
+
+        # =========================
+        # restore feature map
+        # =========================
+        dxy = dxy.transpose(1, 2)
+        dc = dc.transpose(1, 2)
+
+        # undo flatten size (IMPORTANT: use original H/W)
+        dxy = self._unflat(dxy, H // self.r, W // self.r)
+        dc = self._unflat(dc, H // self.r, W // self.r)
+
+        # upsample back
+        dxy = F.interpolate(dxy, size=(H, W), mode="nearest")
+        dc = F.interpolate(dc, size=(H, W), mode="nearest")
+
+        # =========================
+        # projection
+        # =========================
+        dxy = self.proj_xy(dxy)
+        dc = self.proj_c(dc)
+
+        # =========================
+        # gated fusion
+        # =========================
+        alpha = torch.sigmoid(self.alpha)
+        beta = torch.sigmoid(self.beta)
+
+        xy_out = alpha * dxy + (1 - alpha) * xy
+        c_out = beta * dc + (1 - beta) * c
+
+        out = torch.cat([xy_out, c_out], dim=1)
+
+        # residual
+        out = out + x
+
+        return out
+
 
 class Pose(Detect):
     """YOLO Pose head for keypoints models."""
@@ -233,6 +382,7 @@ class Pose(Detect):
         c4 = max(ch[0] // 4, self.nk)
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nk, 1)) for x in ch)
 
+        self.lw = LWModule(self.kpt_shape[0])  # num_kpt = 17
     def forward(self, x):
         """Perform forward pass through YOLO model and return predictions."""
         bs = x[0].shape[0]  # batch size
@@ -242,6 +392,26 @@ class Pose(Detect):
             return x, kpt
         pred_kpt = self.kpts_decode(bs, kpt)
         return torch.cat([x, pred_kpt], 1) if self.export else (torch.cat([x[0], pred_kpt], 1), (x[1], kpt))
+
+    def forward(self, x):
+        """Perform forward pass through YOLO model and return predictions."""
+        bs = x[0].shape[0]  # batch size
+        kpt_feats = []
+        for i in range(self.nl):
+            feat = self.cv4[i](x[i])  # (B, 51, H, W)
+
+            feat = self.lw(feat)  # ⭐ 插入 LWModule
+
+            feat = feat.view(bs, self.nk, -1)
+            kpt_feats.append(feat)
+
+        kpt = torch.cat(kpt_feats, -1)
+        x = Detect.forward(self, x)
+        if self.training:
+            return x, kpt
+        pred_kpt = self.kpts_decode(bs, kpt)
+        return torch.cat([x, pred_kpt], 1) if self.export else (torch.cat([x[0], pred_kpt], 1), (x[1], kpt))
+
 
     def kpts_decode(self, bs, kpts):
         """Decodes keypoints."""
@@ -260,6 +430,44 @@ class Pose(Detect):
             y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
             return y
 
+# class Pose(Detect):
+#     """YOLO Pose head for keypoints models."""
+#
+#     def __init__(self, nc=80, kpt_shape=(17, 3), ch=()):
+#         """Initialize YOLO network with default parameters and Convolutional Layers."""
+#         super().__init__(nc, ch)
+#         self.kpt_shape = kpt_shape  # number of keypoints, number of dims (2 for x,y or 3 for x,y,visible)
+#         self.nk = kpt_shape[0] * kpt_shape[1]  # number of keypoints total
+#
+#         c4 = max(ch[0] // 4, self.nk)
+#         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nk, 1)) for x in ch)
+#     def forward(self, x):
+#         """Perform forward pass through YOLO model and return predictions."""
+#         bs = x[0].shape[0]  # batch size
+#         kpt = torch.cat([self.cv4[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], -1)  # (bs, 17*3, h*w)
+#         x = Detect.forward(self, x)
+#         if self.training:
+#             return x, kpt
+#         pred_kpt = self.kpts_decode(bs, kpt)
+#         return torch.cat([x, pred_kpt], 1) if self.export else (torch.cat([x[0], pred_kpt], 1), (x[1], kpt))
+#
+#
+#     def kpts_decode(self, bs, kpts):
+#         """Decodes keypoints."""
+#         ndim = self.kpt_shape[1]
+#         if self.export:  # required for TFLite export to avoid 'PLACEHOLDER_FOR_GREATER_OP_CODES' bug
+#             y = kpts.view(bs, *self.kpt_shape, -1)
+#             a = (y[:, :, :2] * 2.0 + (self.anchors - 0.5)) * self.strides
+#             if ndim == 3:
+#                 a = torch.cat((a, y[:, :, 2:3].sigmoid()), 2)
+#             return a.view(bs, self.nk, -1)
+#         else:
+#             y = kpts.clone()
+#             if ndim == 3:
+#                 y[:, 2::3] = y[:, 2::3].sigmoid()  # sigmoid (WARNING: inplace .sigmoid_() Apple MPS bug)
+#             y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
+#             y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
+#             return y
 
 class Classify(nn.Module):
     """YOLO classification head, i.e. x(b,c1,20,20) to x(b,c2)."""
@@ -307,7 +515,7 @@ class WorldDetect(Detect):
 
         if self.export and self.format in {"saved_model", "pb", "tflite", "edgetpu", "tfjs"}:  # avoid TF FlexSplitV ops
             box = x_cat[:, : self.reg_max * 4]
-            cls = x_cat[:, self.reg_max * 4 :]
+            cls = x_cat[:, self.reg_max * 4:]
         else:
             box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
 
@@ -347,23 +555,23 @@ class RTDETRDecoder(nn.Module):
     export = False  # export mode
 
     def __init__(
-        self,
-        nc=80,
-        ch=(512, 1024, 2048),
-        hd=256,  # hidden dim
-        nq=300,  # num queries
-        ndp=4,  # num decoder points
-        nh=8,  # num head
-        ndl=6,  # num decoder layers
-        d_ffn=1024,  # dim of feedforward
-        dropout=0.0,
-        act=nn.ReLU(),
-        eval_idx=-1,
-        # Training args
-        nd=100,  # num denoising
-        label_noise_ratio=0.5,
-        box_noise_scale=1.0,
-        learnt_init_query=False,
+            self,
+            nc=80,
+            ch=(512, 1024, 2048),
+            hd=256,  # hidden dim
+            nq=300,  # num queries
+            ndp=4,  # num decoder points
+            nh=8,  # num head
+            ndl=6,  # num decoder layers
+            d_ffn=1024,  # dim of feedforward
+            dropout=0.0,
+            act=nn.ReLU(),
+            eval_idx=-1,
+            # Training args
+            nd=100,  # num denoising
+            label_noise_ratio=0.5,
+            box_noise_scale=1.0,
+            learnt_init_query=False,
     ):
         """
         Initializes the RTDETRDecoder module with the given parameters.
@@ -475,7 +683,7 @@ class RTDETRDecoder(nn.Module):
 
             valid_WH = torch.tensor([w, h], dtype=dtype, device=device)
             grid_xy = (grid_xy.unsqueeze(0) + 0.5) / valid_WH  # (1, h, w, 2)
-            wh = torch.ones_like(grid_xy, dtype=dtype, device=device) * grid_size * (2.0**i)
+            wh = torch.ones_like(grid_xy, dtype=dtype, device=device) * grid_size * (2.0 ** i)
             anchors.append(torch.cat([grid_xy, wh], -1).view(-1, h * w, 4))  # (1, h*w, 4)
 
         anchors = torch.cat(anchors, 1)  # (1, h*w*nl, 4)

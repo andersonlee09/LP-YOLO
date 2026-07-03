@@ -21,6 +21,7 @@ __all__ = (
     "CBAM",
     "Concat",
     "RepConv",
+    "MyCBAM",
 )
 
 
@@ -74,7 +75,7 @@ class Conv2(Conv):
         """Fuse parallel convolutions."""
         w = torch.zeros_like(self.conv.weight.data)
         i = [x // 2 for x in w.shape[2:]]
-        w[:, :, i[0] : i[0] + 1, i[1] : i[1] + 1] = self.cv2.weight.data.clone()
+        w[:, :, i[0]: i[0] + 1, i[1]: i[1] + 1] = self.cv2.weight.data.clone()
         self.conv.weight.data += w
         self.__delattr__("cv2")
         self.forward = self.forward_fuse
@@ -289,6 +290,48 @@ class ChannelAttention(nn.Module):
         return x * self.act(self.fc(self.pool(x)))
 
 
+class MyChannelAttention(nn.Module):
+    """Channel-attention module https://github.com/open-mmlab/mmdetection/tree/v3.0.0rc1/configs/rtmdet."""
+
+    def __init__(self, channels: int) -> None:
+        """Initializes the class and sets the basic configurations and instance variables required."""
+        ratio = 16
+        super(MyChannelAttention, self).__init__()
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // ratio),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // ratio, channels),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Applies forward pass using activation on convolutions of the input, optionally using batch normalization."""
+        b, c, h, w = x.size()
+        max_pool_out = self.max_pool(x).view([b, c])
+        avg_pool_out = self.avg_pool(x).view([b, c])
+        max_fc_out = self.fc(max_pool_out)
+        avg_fc_out = self.fc(avg_pool_out)
+
+        out = self.sigmoid(max_fc_out + avg_fc_out).view(b, c, 1, 1)
+        return out * x
+
+
+class MySpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7) -> None:
+        super(MySpatialAttention, self).__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        max_pool_out = torch.max(x, dim=1, keepdim=True).values
+        avg_pool_out = torch.mean(x, dim=1, keepdim=True)
+        pool_out = torch.cat([max_pool_out, avg_pool_out], dim=1)
+        out = self.sigmoid(self.conv(pool_out))
+        return out * x
+
+
 class SpatialAttention(nn.Module):
     """Spatial-attention module."""
 
@@ -317,6 +360,18 @@ class CBAM(nn.Module):
     def forward(self, x):
         """Applies the forward pass through C1 module."""
         return self.spatial_attention(self.channel_attention(x))
+
+
+class MyCBAM(nn.Module):
+    def __init__(self, c1, kernel_size=7):
+        super().__init__()
+        self.channel_attention = MyChannelAttention(c1)
+        self.spatial_attention = MySpatialAttention(kernel_size)
+
+    def forward(self, x):
+        x = self.channel_attention(x)
+        x = self.spatial_attention(x)
+        return x
 
 
 class Concat(nn.Module):
