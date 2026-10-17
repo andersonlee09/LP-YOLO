@@ -48,3 +48,13 @@ Run training script
 ```
 python ultralytics/ear/train_ear.py
 ```
+
+
+
+🧩 Custom Modules
+
+The implementations of C3k2-DG and C3k-DG are located in ultralytics/nn/modules/block.py:
+
+C3k2-DG: Line 961
+
+C3k-DG: Line 969
